@@ -43,6 +43,8 @@ type Session struct {
 	broken atomic2.Bool
 	config *Config
 
+	dbnum int
+
 	authorized bool
 }
 
@@ -287,7 +289,7 @@ func (s *Session) handleRequest(r *Request, d *Router) error {
 	case "SLOTSMAPPING":
 		return s.handleRequestSlotsMapping(r, d)
 	default:
-		return d.dispatch(r)
+		return d.dispatch(r, s.dbnum)
 	}
 }
 
@@ -323,9 +325,10 @@ func (s *Session) handleSelect(r *Request) error {
 	switch db, err := strconv.Atoi(string(r.Multi[1].Value)); {
 	case err != nil:
 		r.Resp = redis.NewErrorf("ERR invalid DB index")
-	case db != 0:
-		r.Resp = redis.NewErrorf("ERR invalid DB index, only accept DB 0")
+	case db < 0 || db >= config.BackendNumberDatabases:
+		r.Resp = redis.NewErrorf("ERR invalid DB index, only accept DB [0,%d)", config.BackendNumberDatabases)
 	default:
+		s.dbnum = db
 		r.Resp = RespOK
 	}
 	return nil
@@ -337,13 +340,13 @@ func (s *Session) handleRequestPing(r *Request, d *Router) error {
 	switch {
 	case nblks == 0:
 		slot := uint32(time.Now().Nanosecond()) % MaxSlotNum
-		return d.dispatchSlot(r, int(slot))
+		return d.dispatchSlot(r, s.dbnum, int(slot))
 	default:
 		addr = string(r.Multi[1].Value)
 		copy(r.Multi[1:], r.Multi[2:])
 		r.Multi = r.Multi[:nblks]
 	}
-	if !d.dispatchAddr(r, addr) {
+	if !d.dispatchAddr(r, addr, s.dbnum) {
 		r.Resp = redis.NewErrorf("ERR backend server '%s' not found", addr)
 		return nil
 	}
@@ -356,13 +359,13 @@ func (s *Session) handleRequestInfo(r *Request, d *Router) error {
 	switch {
 	case nblks == 0:
 		slot := uint32(time.Now().Nanosecond()) % MaxSlotNum
-		return d.dispatchSlot(r, int(slot))
+		return d.dispatchSlot(r, s.dbnum, int(slot))
 	default:
 		addr = string(r.Multi[1].Value)
 		copy(r.Multi[1:], r.Multi[2:])
 		r.Multi = r.Multi[:nblks]
 	}
-	if !d.dispatchAddr(r, addr) {
+	if !d.dispatchAddr(r, addr, s.dbnum) {
 		r.Resp = redis.NewErrorf("ERR backend server '%s' not found", addr)
 		return nil
 	}
@@ -376,7 +379,7 @@ func (s *Session) handleRequestMGet(r *Request, d *Router) error {
 		r.Resp = redis.NewErrorf("ERR wrong number of arguments for 'MGET' command")
 		return nil
 	case nkeys == 1:
-		return d.dispatch(r)
+		return d.dispatch(r, s.dbnum)
 	}
 	var sub = r.MakeSubRequest(nkeys)
 	for i := range sub {
@@ -384,7 +387,7 @@ func (s *Session) handleRequestMGet(r *Request, d *Router) error {
 			r.Multi[0],
 			r.Multi[i+1],
 		}
-		if err := d.dispatch(&sub[i]); err != nil {
+		if err := d.dispatch(&sub[i], s.dbnum); err != nil {
 			return err
 		}
 	}
@@ -416,7 +419,7 @@ func (s *Session) handleRequestMSet(r *Request, d *Router) error {
 		r.Resp = redis.NewErrorf("ERR wrong number of arguments for 'MSET' command")
 		return nil
 	case nblks == 2:
-		return d.dispatch(r)
+		return d.dispatch(r, s.dbnum)
 	}
 	var sub = r.MakeSubRequest(nblks / 2)
 	for i := range sub {
@@ -425,7 +428,7 @@ func (s *Session) handleRequestMSet(r *Request, d *Router) error {
 			r.Multi[i*2+1],
 			r.Multi[i*2+2],
 		}
-		if err := d.dispatch(&sub[i]); err != nil {
+		if err := d.dispatch(&sub[i], s.dbnum); err != nil {
 			return err
 		}
 	}
@@ -455,7 +458,7 @@ func (s *Session) handleRequestDel(r *Request, d *Router) error {
 		r.Resp = redis.NewErrorf("ERR wrong number of arguments for 'DEL' command")
 		return nil
 	case nkeys == 1:
-		return d.dispatch(r)
+		return d.dispatch(r, s.dbnum)
 	}
 	var sub = r.MakeSubRequest(nkeys)
 	for i := range sub {
@@ -463,7 +466,7 @@ func (s *Session) handleRequestDel(r *Request, d *Router) error {
 			r.Multi[0],
 			r.Multi[i+1],
 		}
-		if err := d.dispatch(&sub[i]); err != nil {
+		if err := d.dispatch(&sub[i], s.dbnum); err != nil {
 			return err
 		}
 	}
@@ -495,7 +498,7 @@ func (s *Session) handleRequestExists(r *Request, d *Router) error {
 		r.Resp = redis.NewErrorf("ERR wrong number of arguments for 'EXISTS' command")
 		return nil
 	case nkeys == 1:
-		return d.dispatch(r)
+		return d.dispatch(r, s.dbnum)
 	}
 	var sub = r.MakeSubRequest(nkeys)
 	for i := range sub {
@@ -503,7 +506,7 @@ func (s *Session) handleRequestExists(r *Request, d *Router) error {
 			r.Multi[0],
 			r.Multi[i+1],
 		}
-		if err := d.dispatch(&sub[i]); err != nil {
+		if err := d.dispatch(&sub[i], s.dbnum); err != nil {
 			return err
 		}
 	}
@@ -542,7 +545,7 @@ func (s *Session) handleRequestSlotsInfo(r *Request, d *Router) error {
 		copy(r.Multi[1:], r.Multi[2:])
 		r.Multi = r.Multi[:nblks]
 	}
-	if !d.dispatchAddr(r, addr) {
+	if !d.dispatchAddr(r, addr, s.dbnum) {
 		r.Resp = redis.NewErrorf("ERR backend server '%s' not found", addr)
 		return nil
 	}
@@ -564,7 +567,7 @@ func (s *Session) handleRequestSlotsScan(r *Request, d *Router) error {
 		r.Resp = redis.NewErrorf("ERR parse slotnum '%s' failed, out of range", r.Multi[1].Value)
 		return nil
 	default:
-		return d.dispatchSlot(r, int(slot))
+		return d.dispatchSlot(r, s.dbnum, int(slot))
 	}
 }
 

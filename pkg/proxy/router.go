@@ -31,8 +31,8 @@ type Router struct {
 
 func NewRouter(config *Config) *Router {
 	s := &Router{config: config}
-	s.pool.primary = newSharedBackendConnPool(config.BackendPrimaryParallel)
-	s.pool.replica = newSharedBackendConnPool(config.BackendReplicaParallel)
+	s.pool.primary = newSharedBackendConnPool(config.BackendPrimaryParallel, config.BackendNumberDatabases)
+	s.pool.replica = newSharedBackendConnPool(config.BackendReplicaParallel, config.BackendNumberDatabases)
 	for i := range s.slots {
 		s.slots[i].id = i
 		s.slots[i].method = &forwardSync{}
@@ -151,30 +151,30 @@ func (s *Router) isOnline() bool {
 	return s.online && !s.closed
 }
 
-func (s *Router) dispatch(r *Request) error {
+func (s *Router) dispatch(r *Request, dbnum int) error {
 	hkey := getHashKey(r.Multi, r.OpStr)
 	var id = Hash(hkey) % MaxSlotNum
 	slot := &s.slots[id]
-	return slot.forward(r, hkey)
+	return slot.forward(r, dbnum, hkey)
 }
 
-func (s *Router) dispatchSlot(r *Request, id int) error {
+func (s *Router) dispatchSlot(r *Request, dbnum int, id int) error {
 	if id < 0 || id >= MaxSlotNum {
 		return ErrInvalidSlotId
 	}
 	slot := &s.slots[id]
-	return slot.forward(r, nil)
+	return slot.forward(r, dbnum, nil)
 }
 
-func (s *Router) dispatchAddr(r *Request, addr string) bool {
+func (s *Router) dispatchAddr(r *Request, addr string, dbnum int) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var seed = r.Seed16()
-	if bc := s.pool.primary.Get(addr).BackendConn(seed, false); bc != nil {
+	if bc := s.pool.primary.Get(addr).BackendConn(dbnum, seed, false); bc != nil {
 		bc.PushBack(r)
 		return true
 	}
-	if bc := s.pool.replica.Get(addr).BackendConn(seed, false); bc != nil {
+	if bc := s.pool.replica.Get(addr).BackendConn(dbnum, seed, false); bc != nil {
 		bc.PushBack(r)
 		return true
 	}

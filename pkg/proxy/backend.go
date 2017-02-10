@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type BackendConn struct {
 	stop sync.Once
 	addr string
 
+	dbnum int
 	input chan *Request
 	retry struct {
 		fails int
@@ -37,9 +39,9 @@ type BackendConn struct {
 	config *Config
 }
 
-func NewBackendConn(addr string, config *Config) *BackendConn {
+func NewBackendConn(addr string, dbnum int, config *Config) *BackendConn {
 	bc := &BackendConn{
-		addr: addr, config: config,
+		addr: addr, dbnum: dbnum, config: config,
 	}
 	bc.input = make(chan *Request, 1024)
 	bc.retry.delay = &DelayExp2{
@@ -104,6 +106,10 @@ func (bc *BackendConn) newBackendReader(round int, config *Config) (*redis.Conn,
 		c.Close()
 		return nil, nil, err
 	}
+	if err := bc.selectDB(c, bc.dbnum); err != nil {
+		c.Close()
+		return nil, nil, err
+	}
 
 	tasks := make(chan *Request, config.BackendMaxPipeline)
 	go bc.loopReader(tasks, c, round)
@@ -119,6 +125,35 @@ func (bc *BackendConn) verifyAuth(c *redis.Conn, auth string) error {
 	multi := []*redis.Resp{
 		redis.NewBulkBytes([]byte("AUTH")),
 		redis.NewBulkBytes([]byte(auth)),
+	}
+
+	if err := c.EncodeMultiBulk(multi, true); err != nil {
+		return err
+	}
+
+	resp, err := c.Decode()
+	switch {
+	case err != nil:
+		return err
+	case resp == nil:
+		return ErrRespIsRequired
+	case resp.IsError():
+		return fmt.Errorf("error resp: %s", resp.Value)
+	case resp.IsString():
+		return nil
+	default:
+		return fmt.Errorf("error resp: should be string, but got %s", resp.Type)
+	}
+}
+
+func (bc *BackendConn) selectDB(c *redis.Conn, dbnum int) error {
+	if dbnum == 0 {
+		return nil
+	}
+
+	multi := []*redis.Resp{
+		redis.NewBulkBytes([]byte("SELECT")),
+		redis.NewBulkBytes([]byte(strconv.Itoa(dbnum))),
 	}
 
 	if err := c.EncodeMultiBulk(multi, true); err != nil {
@@ -261,7 +296,9 @@ type sharedBackendConn struct {
 	port []byte
 
 	owner *sharedBackendConnPool
-	conns []*BackendConn
+	conns [][]*BackendConn
+
+	single *BackendConn
 
 	refcnt int
 }
@@ -276,9 +313,15 @@ func newSharedBackendConn(addr string, config *Config, pool *sharedBackendConnPo
 		host: []byte(host), port: []byte(port),
 	}
 	s.owner = pool
-	s.conns = make([]*BackendConn, pool.parallel)
-	for i := range s.conns {
-		s.conns[i] = NewBackendConn(addr, config)
+	s.conns = make([][]*BackendConn, pool.database)
+	for dbnum := range s.conns {
+		s.conns[dbnum] = make([]*BackendConn, pool.parallel)
+		for i := range s.conns[dbnum] {
+			s.conns[dbnum][i] = NewBackendConn(addr, dbnum, config)
+		}
+	}
+	if len(s.conns) == 1 && len(s.conns[0]) == 1 {
+		s.single = s.conns[0][0]
 	}
 	s.refcnt = 1
 	return s
@@ -303,8 +346,10 @@ func (s *sharedBackendConn) Release() {
 	if s.refcnt != 0 {
 		return
 	}
-	for i := range s.conns {
-		s.conns[i].Close()
+	for dbnum := range s.conns {
+		for i := range s.conns[dbnum] {
+			s.conns[dbnum][i].Close()
+		}
 	}
 	delete(s.owner.pool, s.addr)
 }
@@ -325,37 +370,51 @@ func (s *sharedBackendConn) KeepAlive() {
 	if s == nil {
 		return
 	}
-	for i := range s.conns {
-		s.conns[i].KeepAlive()
+	for dbnum := range s.conns {
+		for i := range s.conns[dbnum] {
+			s.conns[dbnum][i].KeepAlive()
+		}
 	}
 }
 
-func (s *sharedBackendConn) BackendConn(seed uint, must bool) *BackendConn {
+func (s *sharedBackendConn) BackendConn(dbnum int, seed uint, must bool) *BackendConn {
 	if s == nil {
 		return nil
 	}
+
+	if bc := s.single; bc != nil {
+		if must || bc.IsConnected() {
+			return bc
+		} else {
+			return nil
+		}
+	}
+
+	var conns = s.conns[dbnum]
 	var i = seed
-	for _ = range s.conns {
-		i = (i + 1) % uint(len(s.conns))
-		if bc := s.conns[i]; bc.IsConnected() {
+	for _ = range conns {
+		i = (i + 1) % uint(len(conns))
+		if bc := conns[i]; bc.IsConnected() {
 			return bc
 		}
 	}
 	if !must {
 		return nil
 	}
-	return s.conns[0]
+	return s.conns[dbnum][0]
 }
 
 type sharedBackendConnPool struct {
 	parallel int
+	database int
 
 	pool map[string]*sharedBackendConn
 }
 
-func newSharedBackendConnPool(parallel int) *sharedBackendConnPool {
+func newSharedBackendConnPool(parallel, database int) *sharedBackendConnPool {
 	p := &sharedBackendConnPool{}
 	p.parallel = math2.MaxInt(1, parallel)
+	p.database = math2.MaxInt(1, database)
 	p.pool = make(map[string]*sharedBackendConn)
 	return p
 }

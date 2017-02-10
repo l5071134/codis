@@ -16,7 +16,7 @@ import (
 
 type forwardMethod interface {
 	GetId() int
-	Forward(s *Slot, r *Request, hkey []byte) error
+	Forward(s *Slot, r *Request, dbnum int, hkey []byte) error
 }
 
 var (
@@ -32,9 +32,9 @@ func (d *forwardSync) GetId() int {
 	return models.ForwardSync
 }
 
-func (d *forwardSync) Forward(s *Slot, r *Request, hkey []byte) error {
+func (d *forwardSync) Forward(s *Slot, r *Request, dbnum int, hkey []byte) error {
 	s.lock.RLock()
-	bc, err := d.process(s, r, hkey)
+	bc, err := d.process(s, r, dbnum, hkey)
 	s.lock.RUnlock()
 	if err != nil {
 		return err
@@ -43,22 +43,22 @@ func (d *forwardSync) Forward(s *Slot, r *Request, hkey []byte) error {
 	return nil
 }
 
-func (d *forwardSync) process(s *Slot, r *Request, hkey []byte) (*BackendConn, error) {
+func (d *forwardSync) process(s *Slot, r *Request, dbnum int, hkey []byte) (*BackendConn, error) {
 	if s.backend.bc == nil {
-		log.Debugf("slot-%04d is not ready: hash key = '%s'",
-			s.id, hkey)
+		log.Debugf("slot-%04d is not ready: db[%d] hash key = '%s'",
+			s.id, dbnum, hkey)
 		return nil, ErrSlotIsNotReady
 	}
 	if s.migrate.bc != nil && len(hkey) != 0 {
-		if err := d.slotsmgrt(s, hkey, r.Seed16()); err != nil {
-			log.Debugf("slot-%04d migrate from = %s to %s failed: hash key = '%s', error = %s",
-				s.id, s.migrate.bc.Addr(), s.backend.bc.Addr(), hkey, err)
+		if err := d.slotsmgrt(s, dbnum, hkey, r.Seed16()); err != nil {
+			log.Debugf("slot-%04d migrate from = %s to %s failed: db[%d] hash key = '%s', error = %s",
+				s.id, s.migrate.bc.Addr(), s.backend.bc.Addr(), dbnum, hkey, err)
 			return nil, err
 		}
 	}
 	r.Group = &s.refs
 	r.Group.Add(1)
-	return d.forward2(s, r, r.Seed16()), nil
+	return d.forward2(s, r, dbnum, r.Seed16()), nil
 }
 
 type forwardSemiAsync struct {
@@ -69,9 +69,9 @@ func (d *forwardSemiAsync) GetId() int {
 	return models.ForwardSemiAsync
 }
 
-func (d *forwardSemiAsync) Forward(s *Slot, r *Request, hkey []byte) error {
+func (d *forwardSemiAsync) Forward(s *Slot, r *Request, dbnum int, hkey []byte) error {
 	s.lock.RLock()
-	bc, done, err := d.process(s, r, hkey)
+	bc, done, err := d.process(s, r, dbnum, hkey)
 	s.lock.RUnlock()
 	if err != nil || done {
 		return err
@@ -80,16 +80,16 @@ func (d *forwardSemiAsync) Forward(s *Slot, r *Request, hkey []byte) error {
 	return nil
 }
 
-func (d *forwardSemiAsync) process(s *Slot, r *Request, hkey []byte) (*BackendConn, bool, error) {
+func (d *forwardSemiAsync) process(s *Slot, r *Request, dbnum int, hkey []byte) (*BackendConn, bool, error) {
 	if s.backend.bc == nil {
-		log.Debugf("slot-%04d is not ready: hash key = '%s'",
-			s.id, hkey)
+		log.Debugf("slot-%04d is not ready: db[%d] hash key = '%s'",
+			s.id, dbnum, hkey)
 		return nil, false, ErrSlotIsNotReady
 	}
 	if s.migrate.bc != nil && len(hkey) != 0 {
-		if done, err := d.slotsmgrtExecWrapperUntil(s, hkey, r); err != nil {
-			log.Debugf("slot-%04d migrate from = %s to %s failed: hash key = '%s', error = %s",
-				s.id, s.migrate.bc.Addr(), s.backend.bc.Addr(), hkey, err)
+		if done, err := d.slotsmgrtExecWrapperUntil(s, r, dbnum, hkey); err != nil {
+			log.Debugf("slot-%04d migrate from = %s to %s failed: db[%d] hash key = '%s', error = %s",
+				s.id, s.migrate.bc.Addr(), s.backend.bc.Addr(), dbnum, hkey, err)
 			return nil, false, err
 		} else if done {
 			return nil, true, nil
@@ -97,12 +97,12 @@ func (d *forwardSemiAsync) process(s *Slot, r *Request, hkey []byte) (*BackendCo
 	}
 	r.Group = &s.refs
 	r.Group.Add(1)
-	return d.forward2(s, r, r.Seed16()), false, nil
+	return d.forward2(s, r, dbnum, r.Seed16()), false, nil
 }
 
-func (d *forwardSemiAsync) slotsmgrtExecWrapperUntil(s *Slot, hkey []byte, r *Request) (bool, error) {
+func (d *forwardSemiAsync) slotsmgrtExecWrapperUntil(s *Slot, r *Request, dbnum int, hkey []byte) (bool, error) {
 	for i := 0; !r.IsBroken(); i++ {
-		resp, redirect, err := d.slotsmgrtExecWrapper(s, hkey, r.Seed16(), r.Multi)
+		resp, redirect, err := d.slotsmgrtExecWrapper(s, dbnum, hkey, r.Seed16(), r.Multi)
 		switch {
 		case err != nil || redirect:
 			return false, err
@@ -130,7 +130,7 @@ func (d *forwardSemiAsync) slotsmgrtExecWrapperUntil(s *Slot, hkey []byte, r *Re
 type forwardHelper struct {
 }
 
-func (d *forwardHelper) slotsmgrt(s *Slot, hkey []byte, seed uint) error {
+func (d *forwardHelper) slotsmgrt(s *Slot, dbnum int, hkey []byte, seed uint) error {
 	m := &Request{}
 	m.Multi = []*redis.Resp{
 		redis.NewBulkBytes([]byte("SLOTSMGRTTAGONE")),
@@ -141,7 +141,7 @@ func (d *forwardHelper) slotsmgrt(s *Slot, hkey []byte, seed uint) error {
 	}
 	m.Batch = &sync.WaitGroup{}
 
-	s.migrate.bc.BackendConn(seed, true).PushBack(m)
+	s.migrate.bc.BackendConn(dbnum, seed, true).PushBack(m)
 
 	m.Batch.Wait()
 
@@ -154,15 +154,15 @@ func (d *forwardHelper) slotsmgrt(s *Slot, hkey []byte, seed uint) error {
 	case resp.IsError():
 		return fmt.Errorf("bad slotsmgrt resp: %s", resp.Value)
 	case resp.IsInt():
-		log.Debugf("slot-%04d migrate from %s to %s: hash key = %s, resp = %s",
-			s.id, s.migrate.bc.Addr(), s.backend.bc.Addr(), hkey, resp.Value)
+		log.Debugf("slot-%04d migrate from %s to %s: db[%d] hash key = %s, resp = %s",
+			s.id, s.migrate.bc.Addr(), s.backend.bc.Addr(), dbnum, hkey, resp.Value)
 		return nil
 	default:
 		return fmt.Errorf("bad slotsmgrt resp: should be integer, but got %s", resp.Type)
 	}
 }
 
-func (d *forwardHelper) slotsmgrtExecWrapper(s *Slot, hkey []byte, seed uint, multi []*redis.Resp) (_ *redis.Resp, redirect bool, _ error) {
+func (d *forwardHelper) slotsmgrtExecWrapper(s *Slot, dbnum int, hkey []byte, seed uint, multi []*redis.Resp) (_ *redis.Resp, redirect bool, _ error) {
 	m := &Request{}
 	m.Multi = make([]*redis.Resp, 0, 2+len(multi))
 	m.Multi = append(m.Multi,
@@ -172,7 +172,7 @@ func (d *forwardHelper) slotsmgrtExecWrapper(s *Slot, hkey []byte, seed uint, mu
 	m.Multi = append(m.Multi, multi...)
 	m.Batch = &sync.WaitGroup{}
 
-	s.migrate.bc.BackendConn(seed, true).PushBack(m)
+	s.migrate.bc.BackendConn(dbnum, seed, true).PushBack(m)
 
 	m.Batch.Wait()
 
@@ -207,17 +207,17 @@ func (d *forwardHelper) slotsmgrtExecWrapper(s *Slot, hkey []byte, seed uint, mu
 	}
 }
 
-func (d *forwardHelper) forward2(s *Slot, r *Request, seed uint) *BackendConn {
-	if s.migrate.bc == nil && r.IsReadOnly() {
+func (d *forwardHelper) forward2(s *Slot, r *Request, dbnum int, seed uint) *BackendConn {
+	if s.migrate.bc == nil && r.IsReadOnly() && len(s.replicaGroups) != 0 {
 		for _, group := range s.replicaGroups {
 			var i = seed
 			for _ = range group {
 				i = (i + 1) % uint(len(group))
-				if bc := group[i].BackendConn(seed, false); bc != nil {
+				if bc := group[i].BackendConn(dbnum, seed, false); bc != nil {
 					return bc
 				}
 			}
 		}
 	}
-	return s.backend.bc.BackendConn(seed, true)
+	return s.backend.bc.BackendConn(dbnum, seed, true)
 }

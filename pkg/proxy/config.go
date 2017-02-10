@@ -71,6 +71,9 @@ backend_primary_only = false
 backend_primary_parallel = 1
 backend_replica_parallel = 1
 
+# Set backend number of databases.
+backend_number_databases = 1
+
 # Set backend tcp keepalive period. (0 to disable)
 backend_keepalive_period = "75s"
 
@@ -135,6 +138,7 @@ type Config struct {
 	BackendPrimaryOnly     bool              `toml:"backend_primary_only" json:"backend_primary_only"`
 	BackendPrimaryParallel int               `toml:"backend_primary_parallel" json:"backend_primary_parallel"`
 	BackendReplicaParallel int               `toml:"backend_replica_parallel" json:"backend_replica_parallel"`
+	BackendNumberDatabases int               `toml:"backend_number_databases" json:"backend_number_databases"`
 	BackendKeepAlivePeriod timesize.Duration `toml:"backend_keepalive_period" json:"backend_keepalive_period"`
 
 	SessionRecvBufsize     bytesize.Int64    `toml:"session_recv_bufsize" json:"session_recv_bufsize"`
